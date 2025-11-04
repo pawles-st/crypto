@@ -107,9 +107,9 @@ fn main() {
             },
             None => {
                 let mut m1_prime = m1.clone();
-                modify_word_le(&mut m1_prime, 4, 2 << 31, true);
-                modify_word_le(&mut m1_prime, 11, 2 << 15, false);
-                modify_word_le(&mut m1_prime, 14, 2 << 31, true);
+                modify_word_le(&mut m1_prime, 4, 1 << 31, true);
+                modify_word_le(&mut m1_prime, 11, 1 << 15, false);
+                modify_word_le(&mut m1_prime, 14, 1 << 31, true);
                 
                 let digest = round_hasher.finalize_hex();
                 let digest_prime = Md5Collider::new().hash_blocks(&m0_prime, &m1_prime);
