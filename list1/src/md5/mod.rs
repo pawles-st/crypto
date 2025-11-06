@@ -4,6 +4,8 @@ pub mod generation;
 
 use consts::STATE_INIT;
 
+pub use generation::GenType;
+
 #[derive(Clone)]
 pub enum BlockNumber {
     First, Second,
@@ -35,14 +37,24 @@ impl Md5Collider {
     }
 
     #[inline]
-    pub fn verify(&mut self, block: &[u8; 64], block_number: BlockNumber) -> Option<u8> {
-        match block_number {
-            BlockNumber::First => compression::verify_first_block(&mut self.state, block),
-            BlockNumber::Second => compression::verify_second_block(&mut self.state, block),
+    pub fn verify(&mut self, block: &[u8; 64], block_number: BlockNumber, gen_type: GenType) -> Option<u8> {
+        match (block_number, gen_type) {
+            (BlockNumber::First, GenType::SMM) => compression::smm_verify_first_block(&mut self.state, block),
+            (BlockNumber::First, GenType::MMM) => compression::mmm_verify_first_block(&mut self.state, block),
+            (BlockNumber::Second, GenType::SMM) => compression::smm_verify_second_block(&mut self.state, block),
+            (BlockNumber::Second, GenType::MMM) => compression::mmm_verify_second_block(&mut self.state, block),
         }
     }
 
-    /// Finalize and return 16-byte digest (MD5 produces 128-bit digest).
+    #[inline]
+    pub fn verify_full(&mut self, block: &[u8; 64], block_number: BlockNumber) -> Option<u8> {
+        match block_number {
+            BlockNumber::First => compression::full_verify_first_block(&mut self.state, block),
+            BlockNumber::Second => compression::full_verify_second_block(&mut self.state, block),
+        }
+    }
+
+    /// Finalize and return 16-byte digest (128-bit).
     pub fn finalize(&self) -> [u8; 16] {
         let mut out = [0u8; 16];
         out[0..4].copy_from_slice(&self.state[0].to_le_bytes());
@@ -52,13 +64,21 @@ impl Md5Collider {
         out
     }
 
-    /// Convenience: return lowercase hex string of the digest
+    /// Convenience: finalize and return lowercase hex string of the 128-bit digest
     pub fn finalize_hex(&self) -> String {
-        let d = self.finalize();
-        d.iter().map(|b| format!("{:02x}", b)).collect()
+        let digest = self.finalize();
+        hex::encode(digest)
     }
 
-    pub fn hash_blocks(&mut self, m0: &[u8; 64], m1: &[u8; 64]) -> String {
+    /// Return the digest of a two-block message (m0, m1)
+    pub fn hash_blocks(&mut self, m0: &[u8; 64], m1: &[u8; 64]) -> [u8; 16] {
+        self.compress_block(m0);
+        self.compress_block(m1);
+        self.finalize()
+    }
+    
+    /// Convenience: return hex digest of a two-block message (m0, m1)
+    pub fn hash_blocks_hex(&mut self, m0: &[u8; 64], m1: &[u8; 64]) -> String {
         self.compress_block(m0);
         self.compress_block(m1);
         self.finalize_hex()
@@ -72,8 +92,8 @@ impl Md5Collider {
         digest == digest_prime
     }
 
-    pub fn get_state(&self) -> &[u32; 4] {
-        &self.state
+    pub fn get_state(&self) -> [u32; 4] {
+        self.state
     }
 }
 
@@ -82,27 +102,3 @@ impl Default for Md5Collider {
         Self::new()
     }
 }
-
-// -----------------------
-// Helper: quick example usage (will panic if input not 64-byte aligned)
-// -----------------------
-//#[cfg(test)]
-//mod tests {
-    //use super::Md5Collider;
-
-    //#[test]
-    //#[should_panic]
-    //fn panics_on_non_block() {
-        //let mut h = Md5Hasher::new();
-        //h.write(b"not-64-bytes");
-    //}
-
-    //#[test]
-    //fn accepts_single_block() {
-        //// Example single 64-byte block (all zeros) — compress_block must be
-        //// implemented for this test to pass.
-        //let mut h = Md5Hasher::new();
-        //h.write(&[0u8; 64]);
-        //// After implementing compression you can check finalize_hex()
-    //}
-//}
