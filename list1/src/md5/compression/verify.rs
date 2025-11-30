@@ -100,8 +100,6 @@ pub fn smm_verify_second_block(state: &mut [u32; 4], input: &[u8; 64]) -> Option
 
     // round 2
     a = op_g(a, b, c, d, data[1], RC[16], 5);
-    if !verify(a, &[a, b, c, d], 0, A5_ZERO_BITS, Some((1, A5_B4_SAME_BITS)), None) { return Some(16); }
-
     d = op_g(d, a, b, c, data[6], RC[17], 9);
     if !verify(d, &[a, b, c, d], D5_ONE_BITS, D5_ZERO_BITS, Some((0, D5_A5_SAME_BITS)), None) { return Some(17); }
 

@@ -38,8 +38,19 @@ pub fn modify_word_le(msg: &mut [u8], k: usize, delta: u32, add: bool) {
     // write back
     msg[offset..offset + 4].copy_from_slice(&word.to_le_bytes());
 }
+    
+fn check_collision(m0: &[u8; 64], m1: &[u8; 64], m0_prime: &[u8; 64], m1_prime: &[u8; 64]) -> bool {
+    let mut hasher = Md5Collider::new();
+    let digest = hasher.hash_blocks(m0, m1);
+    hasher.reset();
+    let digest_prime = hasher.hash_blocks(m0_prime, m1_prime);
+
+    digest == digest_prime
+}
 
 fn main() {
+    let args: Vec<String> = std::env::args().collect();
+
     let m0 = decode_hex_block(M0_HEX);
     //let m1 = decode_hex_block(M1_HEX);
     //let m0_prime_test = decode_hex_block(M0_PRIME_HEX);
@@ -64,53 +75,59 @@ fn main() {
 
     block = BlockNumber::Second;
     let state = hasher.get_state();
+
+    let mut i: usize = 0;
+    let mut next_stage = 1;
     
+    let mut j = 0;
     let mut collision_found = false;
-    let mut candidates = vec![gen_message(state, block.clone(), GenType::MMM, &mut rng)];
-
-    let mut i: usize = 1;
-    let mut next_stage = 1;    
-
-    // search collision candidates
     while !collision_found {
-        let last_candidate = candidates[0];
+        let mut candidates = vec![gen_message(state, block.clone(), GenType::MMM, &mut rng)];
 
-        for m1 in candidates {
-            if i == next_stage {
-                next_stage <<= 1;
-                println!("computed hashes: {i}");
-            }
+        // search collision candidates
 
-            let mut round_hasher = hasher.clone();
-            let result = round_hasher.verify(&m1, block.clone(), GenType::MMM);
+        for _ in 0..4096 {
+            let last_candidate = candidates[0];
 
-            if result.is_none() { // m1 satisfies differentials
-                let mut m1_prime = m1.clone();
-                modify_word_le(&mut m1_prime, 4, 1 << 31, true);
-                modify_word_le(&mut m1_prime, 11, 1 << 15, false);
-                modify_word_le(&mut m1_prime, 14, 1 << 31, true);
-               
-                // check collision
+            for m1 in candidates {
+                let mut round_hasher = hasher.clone();
+                let result = round_hasher.verify_full(&m1, block.clone());
 
-                let digest = round_hasher.finalize();
-                let digest_prime = Md5Collider::new().hash_blocks(&m0_prime, &m1_prime);
-                
-                if digest == digest_prime {
-                    collision_found = true;
+                if result.is_none() { // m1 satisfies differentials
+                    j += 1;
+                    let mut m1_prime = m1.clone();
+                    modify_word_le(&mut m1_prime, 4, 1 << 31, true);
+                    modify_word_le(&mut m1_prime, 11, 1 << 15, false);
+                    modify_word_le(&mut m1_prime, 14, 1 << 31, true);
+                   
+                    // check collision
+
+                    let digest = round_hasher.finalize();
+                    let digest_prime = Md5Collider::new().hash_blocks(&m0_prime, &m1_prime);
                     
-                    let m0_hex = hex::encode(m0);
-                    let m1_hex = hex::encode(m1);
-                    println!("collision found!\nm0 = {}\nm1 = {}", m0_hex, m1_hex);
-                    break;
-                } else {
-                    println!("met conditions, but NO collision");
+                    if digest == digest_prime {
+                        collision_found = true;
+                        
+                        let m0_hex = hex::encode(m0);
+                        let m1_hex = hex::encode(m1);
+                        println!("collision found!\nm0 = {}\nm1 = {}", m0_hex, m1_hex);
+                        println!("total final candidates: {}", j);
+                        break;
+                    }
+                }
+                
+                i += 1;
+                if i == next_stage {
+                    next_stage <<= 1;
+                    println!("computed hashes: {i}");
                 }
             }
-            
-            i += 1;
+
+            if collision_found { break; }
+
+            candidates = update_message(state, &last_candidate, &mut rng);
+            //println!("new candidates: {}", candidates.len());
         }
-        
-        candidates = update_message(state, &last_candidate, &mut rng);
     }
 }
 

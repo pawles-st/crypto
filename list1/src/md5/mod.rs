@@ -84,14 +84,6 @@ impl Md5Collider {
         self.finalize_hex()
     }
 
-    // TODO: DOES NOT WORK
-    pub fn check_collision(&mut self, m0: &[u8; 64], m1: &[u8; 64], m0_prime: &[u8; 64], m1_prime: &[u8; 64]) -> bool {
-        let digest = self.hash_blocks(m0, m1);
-        let digest_prime = self.hash_blocks(m0_prime, m1_prime);
-
-        digest == digest_prime
-    }
-
     pub fn get_state(&self) -> [u32; 4] {
         self.state
     }

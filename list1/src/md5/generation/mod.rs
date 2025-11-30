@@ -189,6 +189,10 @@ fn multi_message_modification_second(
        
             data[0] = op_f_inv(states[0], states[1], states[2], states[3], 7, RC[0], states[4]);
             data[1] = op_f_inv(states[3], states[4], states[1], states[2], 12, RC[1], states[5]);
+            data[2] = op_f_inv(states[2], states[5], states[4], states[1], 17, RC[2], states[6]);
+            data[3] = op_f_inv(states[1], states[6], states[5], states[4], 22, RC[3], states[7]);
+            data[4] = op_f_inv(states[4], states[7], states[6], states[5], 7, RC[4], states[8]);
+            data[5] = op_f_inv(states[5], states[8], states[7], states[6], 12, RC[5], states[9]);
 
             // compute four initial second-round states
             
@@ -196,14 +200,16 @@ fn multi_message_modification_second(
             let states_21 = op_g(states[17], states_20, states[19], states[18], data[6], RC[17], 9);
             let states_22 = op_g(states[18], states_21, states_20, states[19], data[11], RC[18], 14);
             let states_23 = op_g(states[19], states_22, states_21, states_20, data[0], RC[19], 20);
+            let states_24 = op_g(states_20, states_23, states_22, states_21, data[5], RC[20], 5);
 
             // check if the second-round states fulfill differential conditions;
             // if not, randomise the initial two states anew
             
             if !verify(states_20, &[states[16], states[19], states[18], states[17]], 0, A5_ZERO_BITS, Some((1, A5_B4_SAME_BITS)), None) { continue; }
             if !verify(states_21, &[states_20, states[19], states[18], states[17]], D5_ONE_BITS, D5_ZERO_BITS, Some((0, D5_A5_SAME_BITS)), None) { continue; }
-            if !verify(states_22, &[states_20, states_21, states[18], states[17]], 0, C5_ZERO_BITS, None, None) { continue; }
-            if !verify(states_23, &[states_20, states_21, states_22, states[17]], 0, B5_ZERO_BITS, None, None) { continue; }
+            if !verify(states_22, &[states_20, states[19], states[18], states_21], 0, C5_ZERO_BITS, None, None) { continue; }
+            if !verify(states_23, &[states_20, states[19], states_22, states_21], 0, B5_ZERO_BITS, None, None) { continue; }
+            if !verify(states_24, &[states_20, states_23, states_22, states_23], 0, A6_ZERO_BITS, Some((1, A6_B5_SAME_BITS)), None) { continue; }
 
             conditions_met = true;
             break;
@@ -212,11 +218,6 @@ fn multi_message_modification_second(
         if conditions_met {
 
             // compute the other affected words and return
-            
-            data[2] = op_f_inv(states[2], states[5], states[4], states[1], 17, RC[2], states[6]);
-            data[3] = op_f_inv(states[1], states[6], states[5], states[4], 22, RC[3], states[7]);
-            data[4] = op_f_inv(states[4], states[7], states[6], states[5], 7, RC[4], states[8]);
-            data[5] = op_f_inv(states[5], states[8], states[7], states[6], 12, RC[5], states[9]);
 
             return le_words_to_be_bytes(&data)
         }
