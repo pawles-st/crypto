@@ -1,7 +1,7 @@
 use crypto_bigint::{NonZero, Uint, Zero as BigIntZero};
 use std::fmt::{self, Debug, Display};
 use std::ops::{Add, Div, Mul, Neg, Sub};
-use subtle::{Choice, ConditionallySelectable, ConstantTimeEq, ConstantTimeLess};
+use subtle::{Choice, ConditionallySelectable};
 
 const LIMBS: usize = 4;
 type BigInt = Uint<LIMBS>;
@@ -11,17 +11,33 @@ fn to_decimal(n: &BigInt) -> String {
     if temp == BigInt::ZERO {
         return "0".to_string();
     }
-    let mut s = String::new();
-    let ten = NonZero::new(BigInt::from(10u8)).unwrap();
-    
+
+    let mut parts = Vec::new();
+    // 10^19 is the largest power of 10 that fits in u64
+    const CHUNK_SIZE: u64 = 10_000_000_000_000_000_000;
+    let chunk_big = NonZero::new(BigInt::from(CHUNK_SIZE)).unwrap();
+
     while temp != BigInt::ZERO {
-        let q = temp.div(&ten);
-        let r = temp.rem(&ten);
-        let digit = r.to_le_bytes()[0];
-        s.push(char::from_digit(digit as u32, 10).unwrap());
-        temp = q;
+        let r = temp.rem(&chunk_big);
+        temp = temp.div(&chunk_big);
+        
+        // Convert remainder (which is < 10^19) to u64.
+        let bytes = r.to_le_bytes();
+        let val = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
+        parts.push(val);
     }
-    s.chars().rev().collect()
+
+    let mut s = String::new();
+    let mut iter = parts.into_iter().rev();
+    
+    if let Some(first) = iter.next() {
+        s.push_str(&first.to_string());
+    }
+    
+    for part in iter {
+        s.push_str(&format!("{:019}", part));
+    }
+    s
 }
 
 // --- 1. FIELD TRAIT ---
@@ -227,24 +243,30 @@ impl F2mElement {
 
     /// Performs polynomial long division for binary polynomials (represented as BigInts).
     /// Returns `num mod den`.
+    /// This implementation is constant-time with respect to `num`, assuming `den` is public.
     fn poly_rem(mut num: BigInt, den: &NonZero<BigInt>) -> BigInt {
-        // `bits_vartime` is fine since the value and modulus are not secret in a constructor.
-        let den_bits = den.get().bits_vartime();
-        let mut num_bits = num.bits_vartime();
+        let den_val = den.get();
+        // We assume the reduction polynomial is public, so using bits_vartime for it is acceptable.
+        let den_bits = den_val.bits_vartime();
+        let degree = den_bits - 1;
 
-        if den_bits == 0 {
-            return num;
-        }
-
-        // While degree of num is greater than or equal to degree of den
-        if num_bits >= den_bits {
-            let den_val = den.get();
-            while num_bits >= den_bits {
-                let shift = num_bits - den_bits;
-                let shifted_den = den_val.shl_vartime(shift);
-                num = num ^ shifted_den;
-                num_bits = num.bits_vartime();
-            }
+        // Iterate from the maximum possible bit index down to the degree of the divisor.
+        // This ensures the loop count is independent of `num`'s actual bit length.
+        // BigInt::BITS is a u32.
+        for i in (degree..BigInt::BITS).rev() {
+            // Check the i-th bit of num. `bit()` returns a Choice.
+            let bit_is_set = num.bit(i);
+            
+            // Calculate shift amount.
+            let shift = i - degree;
+            
+            // Shift the denominator to align with the current bit.
+            // Since `shift` depends only on loop index and public degree, `shl_vartime` is fine.
+            let shifted_den = den_val.shl_vartime(shift);
+            
+            // num = num ^ shifted_den IF bit_is_set
+            let xored = num ^ shifted_den;
+            num = BigInt::conditional_select(&num, &xored, bit_is_set.into());
         }
         num
     }
@@ -273,6 +295,76 @@ impl F2mElement {
             mul = mul.shr(1);
         }
         res
+    }
+
+    /// Performs polynomial division u / v, returning (quotient, remainder).
+    /// This is a variable-time implementation.
+    fn poly_div_rem(mut u: BigInt, v: BigInt) -> (BigInt, BigInt) {
+        if v == BigInt::ZERO {
+            panic!("Division by zero");
+        }
+        let mut q = BigInt::ZERO;
+        let v_bits = v.bits_vartime();
+
+        if v_bits == 0 {
+            return (q, u);
+        }
+
+        while !bool::from(u.is_zero()) {
+            let u_bits = u.bits_vartime();
+            if u_bits < v_bits {
+                break;
+            }
+            let diff = u_bits - v_bits;
+            let term = BigInt::ONE.shl_vartime(diff);
+            q = q | term;
+
+            let shifted_v = v.shl_vartime(diff);
+            u = u ^ shifted_v;
+        }
+        (q, u)
+    }
+
+    /// Performs carry-less multiplication of two polynomials.
+    /// This is a variable-time implementation.
+    fn poly_mul(u: BigInt, v: BigInt) -> BigInt {
+        let mut res = BigInt::ZERO;
+        let u_bits = u.bits_vartime();
+        for i in 0..u_bits {
+            if bool::from(u.bit(i)) {
+                res = res ^ v.shl_vartime(i);
+            }
+        }
+        res
+    }
+
+    /// Explicit variable-time inversion using Extended Euclidean Algorithm (XGCD).
+    /// This implementation is not constant-time but may be faster than the constant-time version.
+    pub fn inv_vartime(&self) -> Option<Self> {
+        if bool::from(self.is_zero()) {
+            return None;
+        }
+
+        let mut r0 = self.reduction_poly.get();
+        let mut r1 = self.bits;
+        let mut t0 = BigInt::ZERO;
+        let mut t1 = BigInt::ONE;
+
+        while !bool::from(r1.is_zero()) {
+            let (q, r_new) = Self::poly_div_rem(r0, r1);
+            let q_t1 = Self::poly_mul(q, t1);
+            let t_new = t0 ^ q_t1;
+
+            r0 = r1;
+            r1 = r_new;
+            t0 = t1;
+            t1 = t_new;
+        }
+
+        Some(F2mElement {
+            bits: t0,
+            reduction_poly: self.reduction_poly,
+        })
     }
 }
 
@@ -341,17 +433,23 @@ impl FieldElement for F2mElement {
             return None;
         }
 
-        // The degree of the field, e.g., 256 for F_2^256
-        // This is derived from the reduction_poly, which is publicly known.
-        // So, this is not a side-channel leak.
-        let degree = self.reduction_poly.get().bits_vartime().saturating_sub(1);
+        // Use Fermat's Little Theorem: a^(2^m - 2)
+        // This is effectively constant-time because m is public.
+        let m = self.reduction_poly.get().bits_vartime() - 1;
+        
+        // Construct exponent 2^m - 2.
+        // This is a sequence of m-1 ones followed by a zero.
+        // e.g. m=4 (x^4+...), field F_2^4. Order 2^4-1 = 15. Inverse exponent 14 (1110 binary).
+        let mut exp = BigInt::ZERO;
+        let one = BigInt::ONE;
+        
+        // Set bits 1 through m-1 to 1.
+        for i in 1..m {
+            // exp |= 1 << i
+            let bit = one.shl_vartime(i);
+            exp = exp | bit;
+        }
 
-        // Calculate exponent 2^degree - 2
-        let mut exp = BigInt::ONE;
-        exp = exp.shl(degree as u32);
-        exp = exp.sub(&BigInt::from(2u8));
-
-        // Use pow which is constant-time
         Some(self.pow(&exp))
     }
 
@@ -426,14 +524,14 @@ impl<const DEGREE: usize> FpkElement<DEGREE> {
             }
 
             // Further checks for irre_poly (e.g., non-zero, correct degree) would go here.
-            // For now, we assume it's valid.
+
             Some(FpkElement {
                 coeffs,
                 modulus: nz_modulus,
                 irre_poly,
             })
         } else {
-            None // Modulus cannot be zero
+            None
         }
     }
 
@@ -450,7 +548,7 @@ impl<const DEGREE: usize> FpkElement<DEGREE> {
     fn mul_by_x(&self) -> Self {
         let mut new_coeffs = [BigInt::ZERO; DEGREE];
         // The leading coefficient of the original polynomial.
-        let leading_coeff_before_shift = self.coeffs[DEGREE - 1];
+        let leading_coeff = self.coeffs[DEGREE - 1];
 
         // Shift all coefficients left (c_i -> c_{i-1} for i>0)
         // If coeffs was [c0, c1, c2] for DEGREE=3.
@@ -459,14 +557,179 @@ impl<const DEGREE: usize> FpkElement<DEGREE> {
             new_coeffs[i] = self.coeffs[i-1];
         }
 
-        // The x^DEGREE term (coefficient `leading_coeff_before_shift`) needs reduction.
-        // x^DEGREE = sum(irre_poly[i] * x^i) (mod modulus).
-        // So, we effectively add `leading_coeff_before_shift * irre_poly` to the shifted polynomial.
+        // The x^DEGREE term (coefficient `leading_coeff`) needs reduction.
         for i in 0..DEGREE {
-            let term_to_add = leading_coeff_before_shift.mul_mod(&self.irre_poly[i], &self.modulus);
+            let term_to_add = leading_coeff.mul_mod(&self.irre_poly[i], &self.modulus);
             new_coeffs[i] = new_coeffs[i].add_mod(&term_to_add, &self.modulus);
         }
         Self { coeffs: new_coeffs, ..*self }
+    }
+
+    /// Explicit variable-time inversion using Extended Euclidean Algorithm (XGCD) for polynomials over Fp.
+    pub fn inv_vartime(&self) -> Option<Self> {
+        if bool::from(self.is_zero()) {
+            return None;
+        }
+
+        let p = &self.modulus;
+        
+        // 1. Construct the modulus polynomial P(x) = x^k - irre_poly(x)
+        // irre_poly represents x^k mod P(x). So P(x) = x^k - \sum irre_poly[i] x^i.
+        // Coefficients of P(x):
+        // [ -irre_poly[0], -irre_poly[1], ..., -irre_poly[k-1], 1 ]
+        let mut r0 = Vec::with_capacity(DEGREE + 1);
+        for i in 0..DEGREE {
+            // neg_mod: if val is 0, it's 0. Else p - val.
+            let val = self.irre_poly[i];
+            let neg_val = if val == BigInt::ZERO {
+                BigInt::ZERO
+            } else {
+                p.get().sub_mod(&val, p)
+            };
+            r0.push(neg_val);
+        }
+        r0.push(BigInt::ONE); // x^k term
+
+        // 2. Construct r1 from self
+        let mut r1 = self.coeffs.to_vec();
+        Self::trim_poly(&mut r1);
+
+        let mut t0 = vec![BigInt::ZERO];
+        let mut t1 = vec![BigInt::ONE];
+
+        // 3. XGCD Loop
+        while !r1.is_empty() && (r1.len() > 1 || r1[0] != BigInt::ZERO) {
+            let (q, r_new) = Self::poly_div_rem_vartime(&r0, &r1, p);
+            
+            // t_new = t0 - q * t1
+            let q_t1 = Self::poly_mul_vartime(&q, &t1, p);
+            let t_new = Self::poly_sub_vartime(&t0, &q_t1, p);
+
+            r0 = r1;
+            r1 = r_new;
+            t0 = t1;
+            t1 = t_new;
+        }
+
+        // 4. Finalize
+        // r0 is now the GCD. Since P(x) is irreducible, GCD should be a constant (degree 0).
+        if r0.len() != 1 {
+            // Should theoretically not happen for a field element != 0
+            return None; 
+        }
+        let gcd_const = r0[0];
+        let gcd_inv = gcd_const.inv_mod(&p.get()).into();
+        let gcd_inv = match gcd_inv {
+            Some(inv) => inv,
+            None => return None,
+        };
+
+        // Multiply t0 by gcd_inv to make the result 1
+        let mut res_poly = Vec::new();
+        for c in t0 {
+            res_poly.push(c.mul_mod(&gcd_inv, p));
+        }
+        
+        // Convert Vec back to fixed array
+        let mut coeffs = [BigInt::ZERO; DEGREE];
+        for (i, c) in res_poly.into_iter().enumerate() {
+            if i < DEGREE {
+                coeffs[i] = c;
+            }
+        }
+
+        Some(Self {
+            coeffs,
+            modulus: self.modulus,
+            irre_poly: self.irre_poly,
+        })
+    }
+
+    fn trim_poly(poly: &mut Vec<BigInt>) {
+        while poly.len() > 1 && poly.last().unwrap() == &BigInt::ZERO {
+            poly.pop();
+        }
+    }
+
+    // Returns (Quotient, Remainder)
+    fn poly_div_rem_vartime(u: &[BigInt], v: &[BigInt], p: &NonZero<BigInt>) -> (Vec<BigInt>, Vec<BigInt>) {
+        if v.is_empty() || (v.len() == 1 && v[0] == BigInt::ZERO) {
+             panic!("Division by zero polynomial");
+        }
+
+        let mut r = u.to_vec();
+        let mut q = vec![BigInt::ZERO; u.len().saturating_sub(v.len()) + 1];
+        
+        let v_deg = v.len() - 1;
+        let v_lead = v.last().unwrap();
+        let v_lead_inv = Option::<BigInt>::from(v_lead.inv_mod(&p.get())).expect("Divisor leading coeff not invertible");
+
+        while r.len() >= v.len() {
+            let r_deg = r.len() - 1;
+            if r.last().unwrap() == &BigInt::ZERO {
+                r.pop();
+                continue;
+            }
+
+            let diff_deg = r_deg - v_deg;
+            let scale = r.last().unwrap().mul_mod(&v_lead_inv, p);
+            
+            // q[diff_deg] += scale
+            if diff_deg < q.len() {
+                q[diff_deg] = q[diff_deg].add_mod(&scale, p);
+            }
+
+            // r -= scale * v * x^diff_deg
+            for i in 0..=v_deg {
+                let term = v[i].mul_mod(&scale, p);
+                let target_idx = i + diff_deg;
+                // r[target_idx] -= term
+                // sub_mod requires a < p. Our values are reduced.
+                let val = r[target_idx];
+                r[target_idx] = val.sub_mod(&term, p);
+            }
+            
+            // The leading term of r should now be 0 (or close to it)
+            // We explicitly pop to ensure degree reduces.
+            // However, sub_mod might leave it non-zero if we messed up?
+            // No, scale * v_lead = r_lead. r_lead - r_lead = 0.
+            if r.len() > 0 {
+                r.pop();
+            }
+        }
+        
+        Self::trim_poly(&mut q);
+        Self::trim_poly(&mut r);
+        (q, r)
+    }
+
+    fn poly_mul_vartime(u: &[BigInt], v: &[BigInt], p: &NonZero<BigInt>) -> Vec<BigInt> {
+        if u.is_empty() || v.is_empty() {
+            return vec![BigInt::ZERO];
+        }
+        let mut res = vec![BigInt::ZERO; u.len() + v.len() - 1];
+        for (i, c1) in u.iter().enumerate() {
+            if c1 == &BigInt::ZERO { continue; }
+            for (j, c2) in v.iter().enumerate() {
+                let prod = c1.mul_mod(c2, p);
+                res[i + j] = res[i + j].add_mod(&prod, p);
+            }
+        }
+        Self::trim_poly(&mut res);
+        res
+    }
+
+    fn poly_sub_vartime(u: &[BigInt], v: &[BigInt], p: &NonZero<BigInt>) -> Vec<BigInt> {
+        let max_len = std::cmp::max(u.len(), v.len());
+        let mut res = Vec::with_capacity(max_len);
+        
+        for i in 0..max_len {
+            let c1 = if i < u.len() { u[i] } else { BigInt::ZERO };
+            let c2 = if i < v.len() { v[i] } else { BigInt::ZERO };
+            res.push(c1.sub_mod(&c2, p));
+        }
+        Self::trim_poly(&mut res);
+        res
     }
 }
 
@@ -716,15 +979,12 @@ impl<F: Serializable> Serializable for Point<F> {
     }
 }
 
-// NOTE: The following implementations are NOT constant-time and are vulnerable to
-// side-channel attacks. A production-grade library should use projective coordinates
-// or a different field trait design to allow for constant-time operations.
 impl<F: FieldElement> ConditionallySelectable for Point<F> {
     fn conditional_select(a: &Self, b: &Self, choice: Choice) -> Self {
         if bool::from(choice) {
-            *a
-        } else {
             *b
+        } else {
+            *a
         }
     }
 }
@@ -793,7 +1053,7 @@ impl<F: FieldElement> ShortWeierstrassCurve<F> {
             res = self.add(&res, &res); // Double
             let bit_is_one: Choice = n.bit(i as u32).into();
             let sum = self.add(&res, p);
-            res = Point::conditional_select(&sum, &res, bit_is_one);
+            res = Point::conditional_select(&res, &sum, bit_is_one);
         }
         res
     }
@@ -875,7 +1135,7 @@ impl<F: FieldElement> BinaryCurve<F> {
             res = self.add(&res, &res); // Double
             let bit_is_one: Choice = n.bit(i as u32).into();
             let sum = self.add(&res, p);
-            res = Point::conditional_select(&sum, &res, bit_is_one);
+            res = Point::conditional_select(&res, &sum, bit_is_one);
         }
         res
     }
@@ -1091,6 +1351,24 @@ mod tests {
         assert_eq!(a.pow(&bi(1)), a);
         assert_eq!(a.pow(&bi(2)), a * a);
     }
+
+    #[test]
+    fn test_f2m_inv_vartime() {
+        let poly = bi(REDUCTION_POLY_4 as u64);
+        let a_val = bi(0b0101); // x^2 + 1
+        let a = F2mElement::new(a_val, poly).unwrap();
+        let one = a.one();
+
+        // Calculate inverse using both methods
+        let inv_flt = a.inv().unwrap();
+        let inv_vartime = a.inv_vartime().unwrap();
+
+        // Check if they are equal
+        assert_eq!(inv_flt, inv_vartime);
+
+        // Verify correctness
+        assert_eq!(a * inv_vartime, one);
+    }
     
     // --- 3. Extension Field (Fpk) Tests ---
     #[test]
@@ -1193,6 +1471,31 @@ mod tests {
         assert_eq!(a.pow(&bi(0)), one);
         assert_eq!(a.pow(&bi(1)), a);
         assert_eq!(a.pow(&bi(2)), a * a);
+    }
+    
+    #[test]
+    fn test_fpk_inv_vartime() {
+        const DEGREE: usize = 2;
+        // F_7^2, x^2 - 3
+        let modulus = bi(7);
+        let irre_poly = [bi(3), bi(0)];
+
+        // a = 2x + 1
+        let a_coeffs = [bi(1), bi(2)];
+        let a = FpkElement::<DEGREE>::new(a_coeffs, modulus, irre_poly).unwrap();
+        let one = a.one();
+
+        // Standard constant-time inversion (FLT)
+        let inv_flt = a.inv().unwrap();
+        
+        // New variable-time inversion (XGCD)
+        let inv_vartime = a.inv_vartime().unwrap();
+
+        // Verify equality
+        assert_eq!(inv_flt, inv_vartime);
+        
+        // Verify algebraic correctness
+        assert_eq!(a * inv_vartime, one);
     }
     
     // --- 4. Elliptic Curve Tests ---
