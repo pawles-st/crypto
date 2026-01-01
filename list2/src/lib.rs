@@ -243,7 +243,6 @@ impl F2mElement {
 
     /// Performs polynomial long division for binary polynomials (represented as BigInts).
     /// Returns `num mod den`.
-    /// This implementation is constant-time with respect to `num`, assuming `den` is public.
     fn poly_rem(mut num: BigInt, den: &NonZero<BigInt>) -> BigInt {
         let den_val = den.get();
         // We assume the reduction polynomial is public, so using bits_vartime for it is acceptable.
@@ -438,14 +437,11 @@ impl FieldElement for F2mElement {
         let m = self.reduction_poly.get().bits_vartime() - 1;
         
         // Construct exponent 2^m - 2.
-        // This is a sequence of m-1 ones followed by a zero.
-        // e.g. m=4 (x^4+...), field F_2^4. Order 2^4-1 = 15. Inverse exponent 14 (1110 binary).
         let mut exp = BigInt::ZERO;
         let one = BigInt::ONE;
         
         // Set bits 1 through m-1 to 1.
         for i in 1..m {
-            // exp |= 1 << i
             let bit = one.shl_vartime(i);
             exp = exp | bit;
         }
@@ -547,12 +543,9 @@ impl<const DEGREE: usize> FpkElement<DEGREE> {
     /// Multiplies the polynomial by `x` and reduces the result.
     fn mul_by_x(&self) -> Self {
         let mut new_coeffs = [BigInt::ZERO; DEGREE];
-        // The leading coefficient of the original polynomial.
         let leading_coeff = self.coeffs[DEGREE - 1];
 
         // Shift all coefficients left (c_i -> c_{i-1} for i>0)
-        // If coeffs was [c0, c1, c2] for DEGREE=3.
-        // new_coeffs becomes [0, c0, c1].
         for i in (1..DEGREE).rev() {
             new_coeffs[i] = self.coeffs[i-1];
         }
@@ -574,7 +567,6 @@ impl<const DEGREE: usize> FpkElement<DEGREE> {
         let p = &self.modulus;
         
         // 1. Construct the modulus polynomial P(x) = x^k - irre_poly(x)
-        // irre_poly represents x^k mod P(x). So P(x) = x^k - \sum irre_poly[i] x^i.
         // Coefficients of P(x):
         // [ -irre_poly[0], -irre_poly[1], ..., -irre_poly[k-1], 1 ]
         let mut r0 = Vec::with_capacity(DEGREE + 1);
@@ -816,21 +808,14 @@ impl<const DEGREE: usize> Neg for FpkElement<DEGREE> {
 
 impl<const DEGREE: usize> FieldElement for FpkElement<DEGREE> {
     fn inv(&self) -> Option<Self> {
-        // Use Fermat's Little Theorem for inversion in F_p^k: a^(p^k - 2).
-        // This is secure because the `pow` method is implemented in constant-time.
-        
-        // This check is not constant-time, but inversion of zero is undefined.
-        // A non-zero input is a precondition for this function.
         if bool::from(self.is_zero()) {
             return None;
         }
 
-        // Calculate the field order N = p^k.
+        // Use Fermat's Little Theorem for inversion in F_p^k: a^(p^k - 2).
         let p = self.modulus.get();
         let mut n = BigInt::ONE;
 
-        // This loop calculates p^k. Since DEGREE (k) is a public compile-time
-        // constant, this loop runs a fixed number of times.
         for _ in 0..DEGREE {
             // `widening_mul` returns a `Uint` of double width.
             let wide_n = n.widening_mul(&p);
@@ -838,17 +823,12 @@ impl<const DEGREE: usize> FieldElement for FpkElement<DEGREE> {
             let (lo, hi) = wide_n.split();
 
             // If `hi` is ever non-zero, it means p^k has overflowed our BigInt size,
-            // and this method of inversion is not possible.
             if !bool::from(hi.is_zero()) {
-                // This indicates a configuration error where the field is too large
-                // for this inversion method. Panicking is appropriate for this
-                // unrecoverable configuration problem.
                 panic!("Field order p^k overflows BigInt, cannot use FLT for inversion.");
             }
             n = lo;
         }
 
-        // Calculate exponent p^k - 2
         let exp = n.sub(&BigInt::from(2u8));
 
         Some(self.pow(&exp))
@@ -967,7 +947,7 @@ impl<F: Serializable> Serializable for Point<F> {
 
     fn to_bytes(&self) -> Vec<u8> {
         match self {
-            Point::Infinity => vec![0u8], // standard compressed infinity? Or just 0? OpenSSL uses 0 for infinity sometimes, or specific encoding.
+            Point::Infinity => vec![0u8],
             // SEC1 says infinity is 0x00.
             Point::Affine { x, y } => {
                 let mut bytes = vec![0x04]; // Uncompressed tag
@@ -996,11 +976,8 @@ pub struct ShortWeierstrassCurve<F> {
 
 impl<F: FieldElement> ShortWeierstrassCurve<F> {
     pub fn is_on_curve(&self, p: &Point<F>) -> bool {
-        if bool::from(p.is_infinity()) {
-            return true;
-        }
         match p {
-            Point::Infinity => true, // Should be caught by is_infinity, but for completeness
+            Point::Infinity => true,
             Point::Affine { x, y } => {
                 let y2 = *y * *y;
                 let x3 = *x * *x * *x;
