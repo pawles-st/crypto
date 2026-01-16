@@ -5,22 +5,74 @@ use std::time::Instant;
 
 const SAMPLES: usize = 200;
 
-fn get_stats(data: &[f64]) -> (f64, f64) {
-    let n = data.len() as f64;
-    if n <= 1.0 { return (0.0, 0.0); }
-    let mean = data.iter().sum::<f64>() / n;
-    let variance = data.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / (n - 1.0);
-    (mean, variance)
+// --- Mann-Whitney U Test (Equivalent to Kruskal-Wallis for 2 groups) ---
+
+#[derive(Debug)]
+struct RankedSample {
+    val: f64,
+    group: u8, // 0 for A, 1 for B
 }
 
-fn t_statistic(data_a: &[f64], data_b: &[f64]) -> f64 {
-    let (mean_a, var_a) = get_stats(data_a);
-    let (mean_b, var_b) = get_stats(data_b);
-    let n_a = data_a.len() as f64;
-    let n_b = data_b.len() as f64;
+fn calculate_mann_whitney_z(data_a: &[f64], data_b: &[f64]) -> f64 {
+    let n_a = data_a.len();
+    let n_b = data_b.len();
+    if n_a == 0 || n_b == 0 { return 0.0; }
+
+    let mut combined: Vec<RankedSample> = Vec::with_capacity(n_a + n_b);
+    for &x in data_a { combined.push(RankedSample { val: x, group: 0 }); }
+    for &x in data_b { combined.push(RankedSample { val: x, group: 1 }); }
+
+    // Sort by value. 
+    // Handle NaNs by pushing them to the end (though timing shouldn't be NaN).
+    combined.sort_by(|a, b| a.val.partial_cmp(&b.val).unwrap_or(std::cmp::Ordering::Less));
+
+    // Assign ranks (handling ties by averaging ranks)
+    let mut ranks = vec![0.0; combined.len()];
+    let mut i = 0;
+    while i < combined.len() {
+        let mut j = i + 1;
+        while j < combined.len() && combined[j].val == combined[i].val {
+            j += 1;
+        }
+        
+        // Items from i to j-1 have equal values.
+        // The ranks would be i+1, i+2, ..., j.
+        // Average rank = ( (i+1) + j ) / 2.0
+        let rank_sum = ((i + 1 + j) as f64) / 2.0;
+        
+        for k in i..j {
+            ranks[k] = rank_sum;
+        }
+        i = j;
+    }
+
+    // Sum ranks for group A (R_1)
+    let mut r_a = 0.0;
+    for (idx, item) in combined.iter().enumerate() {
+        if item.group == 0 {
+            r_a += ranks[idx];
+        }
+    }
+
+    // U statistic
+    // U_a = R_a - n_a(n_a + 1)/2
+    let u_a = r_a - (n_a * (n_a + 1)) as f64 / 2.0;
     
-    let stderr = (var_a / n_a + var_b / n_b).sqrt();
-    if stderr == 0.0 { 0.0 } else { (mean_a - mean_b) / stderr }
+    // Mean and Standard Deviation of U (assuming large N approximation)
+    let mu_u = (n_a * n_b) as f64 / 2.0;
+    
+    // Tie correction for variance
+    // sigma_u = sqrt( (n_a * n_b / 12) * (N + 1 - correction) )
+    // Correction involves sum of (t^3 - t) for each set of ties t.
+    // For simplicity in this timing test (where floats rarely tie exactly), we use basic variance.
+    // sigma_u = sqrt( n_a * n_b * (n_a + n_b + 1) / 12 )
+    let sigma_u = ((n_a * n_b * (n_a + n_b + 1)) as f64 / 12.0).sqrt();
+
+    if sigma_u == 0.0 { 0.0 } else { (u_a - mu_u) / sigma_u }
+}
+
+fn get_mean(data: &[f64]) -> f64 {
+    if data.is_empty() { 0.0 } else { data.iter().sum::<f64>() / data.len() as f64 }
 }
 
 fn run_hypothesis_test<T>(name: &str, mut setup_a: impl FnMut() -> T, mut setup_b: impl FnMut() -> T, mut op: impl FnMut(&mut T)) 
@@ -30,6 +82,7 @@ where T: Clone {
     let mut timings_a = Vec::with_capacity(SAMPLES);
     let mut timings_b = Vec::with_capacity(SAMPLES);
 
+    // Interleave execution to minimize environmental drift
     for _ in 0..SAMPLES {
         {
             let mut input = setup_a();
@@ -48,18 +101,21 @@ where T: Clone {
         }
     }
 
-    let t_val = t_statistic(&timings_a, &timings_b);
-    let (mean_a, _) = get_stats(&timings_a);
-    let (mean_b, _) = get_stats(&timings_b);
+    // Calculate Z-score from Mann-Whitney U test
+    let z_score = calculate_mann_whitney_z(&timings_a, &timings_b);
+    
+    // For display purposes, still show means (intuitive), but decision is based on Z-score (ranks).
+    let mean_a = get_mean(&timings_a);
+    let mean_b = get_mean(&timings_b);
 
     println!("  Mean A:  {:.9} s", mean_a);
     println!("  Mean B:  {:.9} s", mean_b);
-    println!("  T-statistic:      {:.4}", t_val);
+    println!("  MW-Z-score:       {:.4}", z_score);
 
-    if t_val.abs() > 15.0 {
-        println!("  [FAIL] Significant timing difference detected!");
+    if z_score.abs() > 6.0 {
+        println!("  [FAIL] {} - Significant timing difference detected!", name);
     } else {
-        println!("  [PASS] No significant difference detected.");
+        println!("  [PASS] {} - No significant difference detected.", name);
     }
 }
 

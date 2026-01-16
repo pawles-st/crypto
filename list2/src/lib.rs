@@ -970,12 +970,66 @@ impl<F: FieldElement> ConditionallySelectable for Point<F> {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
+struct ProjectivePoint<F> {
+    x: F,
+    y: F,
+    z: F,
+}
+
+impl<F: FieldElement + ConditionallySelectable> ConditionallySelectable for ProjectivePoint<F> {
+    fn conditional_select(a: &Self, b: &Self, choice: Choice) -> Self {
+        Self {
+            x: F::conditional_select(&a.x, &b.x, choice),
+            y: F::conditional_select(&a.y, &b.y, choice),
+            z: F::conditional_select(&a.z, &b.z, choice),
+        }
+    }
+}
+
+impl<F: FieldElement> ProjectivePoint<F> {
+    fn zero(field_zero: F, field_one: F) -> Self {
+        Self { x: field_zero, y: field_one, z: field_zero }
+    }
+
+    fn from_affine(p: &Point<F>) -> Self {
+         match p {
+             Point::Infinity => panic!("ProjectivePoint::from_affine called on Infinity internally"),
+             Point::Affine { x, y } => Self { x: *x, y: *y, z: x.one() },
+         }
+    }
+
+    fn to_affine_sw(&self) -> Point<F> {
+        if bool::from(self.z.is_zero()) {
+            Point::Infinity
+        } else {
+            let zinv = self.z.inv().unwrap();
+            let x = self.x * zinv;
+            let y = self.y * zinv;
+            Point::Affine { x, y }
+        }
+    }
+
+    // Lopez-Dahab -> Affine: x = X/Z, y = Y/Z^2
+    fn to_affine_binary(&self) -> Point<F> {
+        if bool::from(self.z.is_zero()) {
+            Point::Infinity
+        } else {
+            let zinv = self.z.inv().unwrap();
+            let zinv2 = zinv * zinv;
+            let x = self.x * zinv;
+            let y = self.y * zinv2;
+            Point::Affine { x, y }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ShortWeierstrassCurve<F> {
     pub a: F,
     pub b: F,
 }
 
-impl<F: FieldElement> ShortWeierstrassCurve<F> {
+impl<F: FieldElement + ConditionallySelectable> ShortWeierstrassCurve<F> {
     pub fn is_on_curve(&self, p: &Point<F>) -> bool {
         match p {
             Point::Infinity => true,
@@ -1025,15 +1079,80 @@ impl<F: FieldElement> ShortWeierstrassCurve<F> {
         }
     }
 
-    pub fn scalar_mul(&self, p: &Point<F>, n: &BigInt) -> Point<F> {
-        let mut res = Point::Infinity;
-        for i in (0..BigInt::BITS).rev() {
-            res = self.add(&res, &res); // Double
-            let bit_is_one: Choice = n.bit(i as u32).into();
-            let sum = self.add(&res, p);
-            res = Point::conditional_select(&res, &sum, bit_is_one);
+    // Explicit doubling formula for Short Weierstrass (Projective)
+    fn double_proj(&self, p: &ProjectivePoint<F>) -> ProjectivePoint<F> {
+        // dbl-1998-cmo
+        let w = self.a * p.z * p.z + p.x * p.x * (p.x.one() + p.x.one() + p.x.one()); // a Z^2 + 3 X^2
+        let s = p.y * p.z;
+        let b = p.x * p.y * s;
+        let h = w * w - b * (b.one() + b.one() + b.one() + b.one() + b.one() + b.one() + b.one() + b.one()); // w^2 - 8 B
+        
+        let two_h_s = (h + h) * s;
+        let x3 = two_h_s;
+        
+        let s_sq = s * s;
+        let eight_y2_s2 = (p.y * p.y * s_sq) * (p.x.one() + p.x.one() + p.x.one() + p.x.one() + p.x.one() + p.x.one() + p.x.one() + p.x.one());
+        let y3 = w * (b * (b.one() + b.one() + b.one() + b.one()) - h) - eight_y2_s2;
+        
+        let z3 = s * s_sq * (s.one() + s.one() + s.one() + s.one() + s.one() + s.one() + s.one() + s.one()); // 8 s^3
+
+        ProjectivePoint { x: x3, y: y3, z: z3 }
+    }
+
+    // Explicit addition formula for Short Weierstrass (Projective + Affine)
+    // Assumes q is Affine (Z=1).
+    fn add_proj_mixed(&self, p: &ProjectivePoint<F>, q_aff: &Point<F>) -> ProjectivePoint<F> {
+        match q_aff {
+            Point::Infinity => *p,
+            Point::Affine { x: x2, y: y2 } => {
+                // u = Y2 * Z1 - Y1 * Z2 (Z2=1) => Y2 * Z1 - Y1
+                let u = *y2 * p.z - p.y;
+                // v = X2 * Z1 - X1 * Z2 (Z2=1) => X2 * Z1 - X1
+                let v = *x2 * p.z - p.x;
+                
+                // A = u^2 * Z1 * Z2 - v^3 - 2 * v^2 * X1 * Z2
+                // Z2=1 => u^2 * Z1 - v^3 - 2 * v^2 * X1
+                let v_sq = v * v;
+                let v_cu = v_sq * v;
+                let a_term = u * u * p.z - v_cu - (v_sq * p.x) * (p.x.one() + p.x.one());
+                
+                let x3 = v * a_term;
+                
+                // Y3 = u * (v^2 * X1 * Z2 - A) - v^3 * Y1 * Z2
+                // Z2=1 => u * (v^2 * X1 - A) - v^3 * Y1
+                let y3 = u * (v_sq * p.x - a_term) - v_cu * p.y;
+                
+                // Z3 = v^3 * Z1 * Z2 => v^3 * Z1
+                let z3 = v_cu * p.z;
+                
+                ProjectivePoint { x: x3, y: y3, z: z3 }
+            }
         }
-        res
+    }
+
+    pub fn scalar_mul(&self, p: &Point<F>, n: &BigInt) -> Point<F> {
+        if let Point::Infinity = p {
+            return Point::Infinity;
+        }
+
+        // Use Projective Coordinates for Constant Time Execution
+        let p_proj = ProjectivePoint::from_affine(p);
+        let mut res = ProjectivePoint::zero(self.a.zero(), self.a.one()); // Zero is (0:1:0)
+
+        for i in (0..BigInt::BITS).rev() {
+            res = self.double_proj(&res);
+            
+            let sum = self.add_proj_mixed(&res, p);
+            
+            // If res was Zero, add_proj_mixed might return garbage (or Zero if logic holds).
+            // But Zero + P = P.
+            let sum = ProjectivePoint::conditional_select(&sum, &p_proj, res.z.is_zero());
+
+            let bit_is_one: Choice = n.bit(i as u32).into();
+            res = ProjectivePoint::conditional_select(&res, &sum, bit_is_one);
+        }
+        
+        res.to_affine_sw()
     }
 }
 
@@ -1043,7 +1162,7 @@ pub struct BinaryCurve<F> {
     pub b: F,
 }
 
-impl<F: FieldElement> BinaryCurve<F> {
+impl<F: FieldElement + ConditionallySelectable> BinaryCurve<F> {
     pub fn is_on_curve(&self, p: &Point<F>) -> bool {
         if bool::from(p.is_infinity()) {
             return true;
@@ -1108,15 +1227,97 @@ impl<F: FieldElement> BinaryCurve<F> {
         }
     }
 
-    pub fn scalar_mul(&self, p: &Point<F>, n: &BigInt) -> Point<F> {
-        let mut res = Point::Infinity;
-        for i in (0..BigInt::BITS).rev() {
-            res = self.add(&res, &res); // Double
-            let bit_is_one: Choice = n.bit(i as u32).into();
-            let sum = self.add(&res, p);
-            res = Point::conditional_select(&res, &sum, bit_is_one);
+    // Lopez-Dahab Doubling
+    fn double_proj(&self, p: &ProjectivePoint<F>) -> ProjectivePoint<F> {
+        // A = X^2
+        let a_term = p.x * p.x;
+        // B = Z^2
+        let b_term = p.z * p.z;
+        // Z3 = A * B
+        let z3 = a_term * b_term;
+        // C = A^2
+        let c_term = a_term * a_term;
+        // D = b * B^2
+        let d_term = self.b * b_term * b_term;
+        // X3 = C + D
+        let x3 = c_term + d_term;
+        // Y3 = D * Z3 + X3 * (a * Z3 + Y^2 + D)
+        let y_sq = p.y * p.y;
+        let inner = self.a * z3 + y_sq + d_term;
+        let y3 = d_term * z3 + x3 * inner;
+
+        ProjectivePoint { x: x3, y: y3, z: z3 }
+    }
+
+    // Lopez-Dahab Mixed Addition (Z2=1)
+    fn add_proj_mixed(&self, p: &ProjectivePoint<F>, q_aff: &Point<F>) -> ProjectivePoint<F> {
+        match q_aff {
+            Point::Infinity => *p,
+            Point::Affine { x: x2, y: y2 } => {
+                // A = X1 + X2 * Z1
+                let a_term = p.x + *x2 * p.z;
+                // B = Y1 + Y2 * Z1^2
+                let z1_sq = p.z * p.z;
+                let b_term = p.y + *y2 * z1_sq;
+                
+                // C = Z1 * A
+                let c_term = p.z * a_term;
+                // D = Z2 * C = C (since Z2=1)
+                let d_term = c_term;
+                
+                // Z3 = D^2
+                let z3 = d_term * d_term;
+                
+                // X3 = D * (A^2 + B) + B^2 + a * Z3
+                let a_sq = a_term * a_term;
+                let term1 = d_term * (a_sq + b_term);
+                let b_sq = b_term * b_term;
+                let term3 = self.a * z3;
+                let x3 = term1 + b_sq + term3;
+                
+                // E = C * D = C^2
+                let e_term = c_term * c_term;
+                // F = E^2 * Y2
+                let f_term = e_term * e_term * *y2;
+                // G = X3 + X2 * E
+                let g_term = x3 + *x2 * e_term;
+                // Y3 = Z3 * X3 + F + B * D * G
+                // Note: In binary fields, addition is XOR, so order doesn't matter, but terms are terms.
+                let y3 = z3 * x3 + f_term + b_term * d_term * g_term;
+
+                ProjectivePoint { x: x3, y: y3, z: z3 }
+            }
         }
-        res
+    }
+
+    pub fn scalar_mul(&self, p: &Point<F>, n: &BigInt) -> Point<F> {
+        if let Point::Infinity = p {
+            return Point::Infinity;
+        }
+
+        // Use Lopez-Dahab Projective Coordinates
+        let p_proj = ProjectivePoint::from_affine(p); // LD (x, y, 1) corresponds to affine (x, y)
+        // Zero in LD is (1, 0, 0)? No, Point at Infinity is Z=0.
+        // Let's use (0, 0, 0) for Zero Z, but avoiding 0*0 issues?
+        // Actually, formulas usually handle Z=0 as Infinity.
+        // Let's initialize res to Zero (0, 1, 0) equivalent?
+        // Wait, for LD, if Z=0, X!=0 means Infinity. (1, 0, 0) is usually Infinity.
+        // Let's use ProjectivePoint::zero which is (0, 1, 0).
+        let mut res = ProjectivePoint::zero(self.a.zero(), self.a.one()); 
+
+        for i in (0..BigInt::BITS).rev() {
+            res = self.double_proj(&res);
+            
+            let sum = self.add_proj_mixed(&res, p);
+            
+            // Fixup for Identity
+            let sum = ProjectivePoint::conditional_select(&sum, &p_proj, res.z.is_zero());
+
+            let bit_is_one: Choice = n.bit(i as u32).into();
+            res = ProjectivePoint::conditional_select(&res, &sum, bit_is_one);
+        }
+        
+        res.to_affine_binary()
     }
 }
 
