@@ -969,6 +969,7 @@ impl<F: FieldElement> ConditionallySelectable for Point<F> {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ShortWeierstrassCurve<F> {
     pub a: F,
     pub b: F,
@@ -1036,6 +1037,7 @@ impl<F: FieldElement> ShortWeierstrassCurve<F> {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct BinaryCurve<F> {
     pub a: F,
     pub b: F,
